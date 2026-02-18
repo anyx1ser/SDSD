@@ -5,45 +5,50 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
 
 func main() {
 	// Command-line flags
-	logPath := flag.String("log", "/var/log/audit/audit.log", "Path to audit log file")
+	monitorPaths := flag.String("paths", "/home,/etc,/var,/tmp,/opt", "Comma-separated paths to monitor")
 	windowSize := flag.Duration("window", 10*time.Second, "Aggregation window size")
 	baselineWindows := flag.Int("baseline", 30, "Number of windows for baseline learning")
 	zscoreThreshold := flag.Float64("threshold", 2.5, "Z-score threshold for anomaly detection")
-	pollInterval := flag.Duration("poll", 500*time.Millisecond, "Poll interval for log file")
 	verbose := flag.Bool("verbose", false, "Enable verbose output")
 
 	flag.Parse()
 
-	fmt.Printf("=== Linux Anomaly Detection Agent ===\n")
-	fmt.Printf("Log file: %s\n", *logPath)
+	// Check for root privileges
+	if os.Geteuid() != 0 {
+		fmt.Fprintf(os.Stderr, "ERROR: fanotify requires root privileges (use sudo)\n")
+		os.Exit(1)
+	}
+
+	// Parse monitor paths
+	paths := strings.Split(*monitorPaths, ",")
+	for i, p := range paths {
+		paths[i] = strings.TrimSpace(p)
+	}
+
+	fmt.Printf("=== Linux Anomaly Detection Agent (fanotify) ===\n")
+	fmt.Printf("Monitor paths: %s\n", strings.Join(paths, ", "))
 	fmt.Printf("Window size: %v\n", *windowSize)
 	fmt.Printf("Baseline windows: %d\n", *baselineWindows)
 	fmt.Printf("Z-score threshold: %.1f\n", *zscoreThreshold)
-	fmt.Printf("Poll interval: %v\n", *pollInterval)
-	fmt.Printf("=====================================\n\n")
+	fmt.Printf("Verbose: %v\n", *verbose)
+	fmt.Printf("==================================================\n\n")
 
-	// Verify audit log exists and is readable
-	if _, err := os.Stat(*logPath); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Cannot access audit log: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Make sure auditd is running and you have sudo privileges\n")
+	// Create fanotify monitor
+	monitor := NewFanotifyMonitor(paths)
+	if err := monitor.Init(); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to initialize fanotify: %v\n", err)
 		os.Exit(1)
 	}
+	defer monitor.Close()
 
-	// Create components
-	logReader := NewLogReader(*logPath)
-	if err := logReader.Open(); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to open log: %v\n", err)
-		os.Exit(1)
-	}
-	defer logReader.Close()
-
-	parser := NewAuditParser()
+	// Create aggregator
 	aggregator := NewAggregator(*windowSize)
 
 	alertsChan := make(chan AnomalyAlert, 100)
@@ -54,57 +59,37 @@ func main() {
 		*zscoreThreshold,
 	)
 
-	// Start goroutines for each component
-	linesChan := make(chan string, 1000)
-
-	go logReader.Tail(linesChan, *pollInterval)
+	// Start goroutines for components
 	go aggregator.Start()
 	go detector.Start()
-	go processLines(linesChan, parser, aggregator, *verbose)
 	go printAlerts(alertsChan)
+
+	// Start monitoring in a separate goroutine
+	go func() {
+		err := monitor.Start(aggregator.GetEventsChan())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[ERROR] Monitor failed: %v\n", err)
+			os.Exit(1)
+		}
+	}()
 
 	// Setup graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	fmt.Println("[INFO] Agent started. Press Ctrl+C to stop.")
+	fmt.Println("[INFO] Monitoring file system events...")
 	fmt.Println("[INFO] Learning baseline behavior...")
 
 	// Wait for shutdown signal
 	sig := <-sigChan
 	fmt.Printf("\n[INFO] Received signal %v, shutting down...\n", sig)
 
-	logReader.Close()
-	close(linesChan)
+	monitor.Close()
 
 	// Brief wait for cleanup
 	time.Sleep(100 * time.Millisecond)
 	os.Exit(0)
-}
-
-// processLines reads audit log lines and sends them to the parser
-func processLines(linesChan <-chan string, parser *AuditParser, aggregator *Aggregator, verbose bool) {
-	eventsChan := aggregator.GetEventsChan()
-	parseErrors := 0
-
-	for line := range linesChan {
-		event := parser.ParseEvent(line)
-		if event != nil {
-			select {
-			case eventsChan <- *event:
-				if verbose {
-					fmt.Printf("[PARSE] %s: %s on %s\n", event.ProcessName, event.EventType, event.FilePath)
-				}
-			default:
-				// Channel full
-			}
-		} else {
-			parseErrors++
-			if verbose && parseErrors%1000 == 0 {
-				fmt.Printf("[WARN] Unable to parse events (last 1000 lines)\n")
-			}
-		}
-	}
 }
 
 // printAlerts outputs detected anomalies in a formatted manner

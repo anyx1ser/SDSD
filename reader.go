@@ -1,125 +1,181 @@
 package main
 
 import (
-	"bufio"
+	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
-// LogReader handles incremental reading of audit log files
-type LogReader struct {
-	filePath   string
-	file       *os.File
-	reader     *bufio.Reader
-	offset     int64
-	lastModify time.Time
+const (
+	FAN_CLASS_NOTIF      = 0x0
+	FAN_ACCESS           = 0x1
+	FAN_MODIFY           = 0x2
+	FAN_CLOSE_WRITE      = 0x8
+	FAN_CLOSE_NOWRITE    = 0x10
+	FAN_OPEN             = 0x20
+	FAN_OPEN_EXEC        = 0x1000
+	FAN_ACCESS_PERM      = 0x20000
+	FAN_ONDIR            = 0x40000000
+	FAN_EVENT_ON_CHILD   = 0x08000000
+	FAN_UNLIMITED_QUEUE  = 0x0
+	FAN_UNLIMITED_MARKS  = 0x20
+	FAN_MARK_ADD         = 0x1
+	FAN_MARK_FILESYSTEM  = 0x100
+)
+
+type FanotifyEvent struct {
+	EventLen    uint32
+	Vers        uint8
+	Reserved    uint8
+	Metadata    uint16
+	Mask        uint64
+	Fd          int32
+	Pid         int32
+	_           [4]byte // padding
 }
 
-// NewLogReader creates a new log reader for the audit log file
-func NewLogReader(filePath string) *LogReader {
-	return &LogReader{
-		filePath: filePath,
+// FanotifyMonitor monitors file system events using fanotify
+type FanotifyMonitor struct {
+	fd      int
+	targets []string
+}
+
+// NewFanotifyMonitor creates a new fanotify monitor for targets
+func NewFanotifyMonitor(targets []string) *FanotifyMonitor {
+	return &FanotifyMonitor{
+		fd:      -1,
+		targets: targets,
 	}
 }
 
-// Open initializes the log reader and seeks to the end of the file
-func (lr *LogReader) Open() error {
-	file, err := os.OpenFile(lr.filePath, os.O_RDONLY, 0644)
+// Init initializes the fanotify monitor
+func (fm *FanotifyMonitor) Init() error {
+	// Initialize fanotify
+	fd, err := unix.FanotifyInit(FAN_CLASS_NOTIF|FAN_UNLIMITED_QUEUE|FAN_UNLIMITED_MARKS, unix.O_CLOEXEC)
 	if err != nil {
-		return fmt.Errorf("failed to open log file: %w", err)
+		return fmt.Errorf("fanotify_init failed: %w", err)
 	}
+	fm.fd = fd
 
-	// Get file info to store last modify time
-	info, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return fmt.Errorf("failed to stat file: %w", err)
-	}
-
-	lr.file = file
-	lr.reader = bufio.NewReaderSize(file, 65536) // 64KB buffer for efficiency
-	lr.offset, _ = file.Seek(0, 2)                // Seek to end
-	lr.lastModify = info.ModTime()
-
-	return nil
-}
-
-// Close closes the log file
-func (lr *LogReader) Close() error {
-	if lr.file != nil {
-		return lr.file.Close()
-	}
-	return nil
-}
-
-// ReadLine reads the next available line from the log file
-// Returns empty string if no new lines are available
-func (lr *LogReader) ReadLine() (string, error) {
-	// Check if file has been rotated or modified
-	info, err := os.Stat(lr.filePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to stat file: %w", err)
-	}
-
-	// If file size decreased or was rotated (modify time jumped), reopen
-	if info.Size() < lr.offset || (info.ModTime().After(lr.lastModify) && info.Size() < lr.offset) {
-		lr.Close()
-		return "", fmt.Errorf("log file rotated, will reopen")
-	}
-
-	line, err := lr.reader.ReadString('\n')
-	if err != nil {
-		// EOF is normal, not an error condition
-		if err.Error() == "EOF" {
-			return "", nil
+	// Mark targets for monitoring
+	for _, target := range fm.targets {
+		err = unix.FanotifyMark(
+			fd,
+			FAN_MARK_ADD|FAN_MARK_FILESYSTEM,
+			FAN_OPEN|FAN_CLOSE_WRITE|FAN_ACCESS|FAN_OPEN_EXEC,
+			unix.AT_FDCWD,
+			target,
+		)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: fanotify_mark for %s: %v\n", target, err)
+			// Continue with other targets even if one fails
 		}
-		return "", err
 	}
 
-	lr.offset += int64(len(line))
-	lr.lastModify = info.ModTime()
-
-	// Remove trailing newline
-	if len(line) > 0 && line[len(line)-1] == '\n' {
-		line = line[:len(line)-1]
-	}
-
-	return line, nil
+	return nil
 }
 
-// Tail continuously reads new lines from the log file with polling interval
-// Sends lines to the provided channel, respecting context for graceful shutdown
-func (lr *LogReader) Tail(linesChan chan<- string, pollInterval time.Duration) error {
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
+// Close closes the fanotify monitor
+func (fm *FanotifyMonitor) Close() error {
+	if fm.fd >= 0 {
+		return unix.Close(fm.fd)
+	}
+	return nil
+}
 
-	for range ticker.C {
-		// Try to read available lines
-		for {
-			line, err := lr.ReadLine()
+// Start begins monitoring file system events and sends AuditEvents to the aggregator
+func (fm *FanotifyMonitor) Start(eventsChan chan<- AuditEvent) error {
+	if fm.fd < 0 {
+		return fmt.Errorf("fanotify monitor not initialized")
+	}
+
+	buf := make([]byte, 4096)
+
+	for {
+		// Read events
+		n, err := unix.Read(fm.fd, buf)
+		if err != nil {
+			return fmt.Errorf("read fanotify events: %w", err)
+		}
+
+		if n <= 0 {
+			continue
+		}
+
+		// Parse events
+		offset := 0
+		for offset < n {
+			if offset+unsafe.Sizeof(FanotifyEvent{}) > n {
+				break
+			}
+
+			// Parse event header
+			eventData := buf[offset : offset+int(unsafe.Sizeof(FanotifyEvent{}))]
+			event := (*FanotifyEvent)(unsafe.Pointer(&eventData[0]))
+
+			// Get file descriptor info
+			fdPath := fmt.Sprintf("/proc/self/fd/%d", event.Fd)
+			filePath, err := os.Readlink(fdPath)
 			if err != nil {
-				// File rotated, attempt to reopen
-				lr.Close()
-				if err := lr.Open(); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to reopen log file: %v\n", err)
-					time.Sleep(time.Second)
-					break
-				}
+				// Skip if we can't read the file path
+				unix.Close(int(event.Fd))
+				offset += int(event.EventLen)
 				continue
 			}
 
-			if line == "" {
-				break // No more lines available
+			// Get process name
+			procPath := fmt.Sprintf("/proc/%d/comm", event.Pid)
+			procNameBytes, err := os.ReadFile(procPath)
+			var procName string
+			if err == nil {
+				procName = strings.TrimSpace(string(procNameBytes))
+			} else {
+				procName = fmt.Sprintf("pid_%d", event.Pid)
 			}
 
-			select {
-			case linesChan <- line:
+			// Determine event type
+			var eventType string
+			switch {
+			case event.Mask&FAN_OPEN != 0:
+				eventType = "open"
+			case event.Mask&FAN_CLOSE_WRITE != 0:
+				eventType = "close_write"
+			case event.Mask&FAN_ACCESS != 0:
+				eventType = "read"
+			case event.Mask&FAN_OPEN_EXEC != 0:
+				eventType = "execve"
 			default:
-				// Channel full, skip this line to maintain responsiveness
+				eventType = "file_op"
 			}
+
+			// Create audit event
+			auditEvent := AuditEvent{
+				Timestamp:   time.Now(),
+				UID:         fmt.Sprintf("%d", event.Pid),
+				ProcessName: procName,
+				FilePath:    filePath,
+				EventType:   eventType,
+				Success:     true,
+			}
+
+			// Send to aggregator
+			select {
+			case eventsChan <- auditEvent:
+			default:
+				// Channel full, drop event
+			}
+
+			// Close the file descriptor
+			unix.Close(int(event.Fd))
+
+			offset += int(event.EventLen)
 		}
 	}
-
-	return nil
 }
