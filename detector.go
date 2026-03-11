@@ -1,229 +1,267 @@
 package main
 
+// detector.go
+//
+// ML-based anomaly detector using Isolation Forest (per-user baselines).
+//
+// Lifecycle for each UID
+// ----------------------
+//  Phase 1 – Baseline collection
+//    The first <baselineWindowCount> FeatureVectors for a UID are accumulated
+//    as raw training samples.  They are also persisted to the feature_vectors
+//    table for audit/re-training purposes.
+//
+//  Phase 2 – Training
+//    When enough samples have been collected the IsolationForest is trained,
+//    the decision threshold is derived from the training data at the specified
+//    contamination level, and the serialised model is saved to the baselines
+//    table.
+//
+//  Phase 3 – Detection
+//    Every subsequent FeatureVector is scored.  If the anomaly score ≥ the
+//    per-user threshold an AnomalyAlert is emitted and written to the alerts
+//    table.  The feature vector is also persisted regardless of its label.
+//
+// On startup the detector tries to load an existing baseline from the DB for
+// each UID it encounters; if one is found the UID skips straight to phase 3.
+
 import (
 	"fmt"
-	"math"
+	"strings"
 	"time"
 )
 
-// AnomalyDetector implements statistical anomaly detection
-type AnomalyDetector struct {
-	baselineWindowCount int           // Number of windows to use for baseline
-	zscoreThreshold     float64       // Z-score threshold for anomaly detection (default 2.5)
-	stats               *WindowStats
-	windowsProcessed    int
-	featuresChan        <-chan FeatureVector
-	alertsChan          chan<- AnomalyAlert
+// ──────────────────────────────────────────────────────────────────────────────
+// Per-UID state
+// ──────────────────────────────────────────────────────────────────────────────
+
+type detectorPhase int
+
+const (
+	phaseCollecting detectorPhase = iota // accumulating baseline samples
+	phaseDetecting                       // model trained, scoring live windows
+)
+
+// perUIDState holds everything the detector needs for one user.
+type perUIDState struct {
+	phase         detectorPhase
+	trainingData  [][]float64      // raw feature arrays collected during phase 1
+	model         *IsolationForest // nil until training is complete
+	windowsScored int
 }
 
-// NewAnomalyDetector creates a new detector with specified parameters
+// ──────────────────────────────────────────────────────────────────────────────
+// AnomalyDetector
+// ──────────────────────────────────────────────────────────────────────────────
+
+// AnomalyDetector reads FeatureVectors, manages a per-UID IsolationForest, and
+// emits AnomalyAlerts.
+type AnomalyDetector struct {
+	// Hyper-parameters
+	baselineWindowCount int
+	numTrees            int
+	sampleSize          int
+	contamination       float64
+
+	// Channels
+	featuresChan <-chan FeatureVector
+	alertsChan   chan<- AnomalyAlert
+
+	// SQLite persistence (nil disables persistence, useful in tests)
+	db *Database
+
+	// Per-UID runtime state (uid -> state)
+	uids map[string]*perUIDState
+}
+
+// NewAnomalyDetector creates a detector with the given hyper-parameters.
 func NewAnomalyDetector(
 	featuresChan <-chan FeatureVector,
 	alertsChan chan<- AnomalyAlert,
+	db *Database,
 	baselineWindowCount int,
-	zscoreThreshold float64,
+	numTrees int,
+	sampleSize int,
+	contamination float64,
 ) *AnomalyDetector {
 	return &AnomalyDetector{
 		baselineWindowCount: baselineWindowCount,
-		zscoreThreshold:     zscoreThreshold,
-		stats: &WindowStats{
-			FileAccessCount:  make([]float64, 0),
-			UniqueFileCount:  make([]float64, 0),
-			ReadCount:        make([]float64, 0),
-			ExecCount:        make([]float64, 0),
-		},
-		windowsProcessed: 0,
-		featuresChan:     featuresChan,
-		alertsChan:       alertsChan,
+		numTrees:            numTrees,
+		sampleSize:          sampleSize,
+		contamination:       contamination,
+		featuresChan:        featuresChan,
+		alertsChan:          alertsChan,
+		db:                  db,
+		uids:                make(map[string]*perUIDState),
 	}
 }
 
-// Start begins the anomaly detection process
-// Should be run in a goroutine
+// Start runs the detection loop.  Call in a goroutine.
 func (ad *AnomalyDetector) Start() {
-	for features := range ad.featuresChan {
-		ad.processWindow(features)
+	for fv := range ad.featuresChan {
+		ad.processWindow(fv)
 	}
 }
 
-// processWindow analyzes a feature vector for anomalies
-func (ad *AnomalyDetector) processWindow(features FeatureVector) {
-	ad.windowsProcessed++
+// ──────────────────────────────────────────────────────────────────────────────
+// Core logic
+// ──────────────────────────────────────────────────────────────────────────────
 
-	// During baseline phase, collect statistics
-	if ad.windowsProcessed <= ad.baselineWindowCount {
-		ad.collectBaseline(features)
+// processWindow handles one incoming FeatureVector.
+func (ad *AnomalyDetector) processWindow(fv FeatureVector) {
+	uid := fv.UID
 
-		// Once we have enough baseline data, compute statistics
-		if ad.windowsProcessed == ad.baselineWindowCount {
-			ad.computeBaselineStats()
-			fmt.Printf("[INFO] Baseline learning complete after %d windows\n", ad.baselineWindowCount)
-		}
-		return
+	// First time we see this UID: try to load a persisted baseline.
+	if _, exists := ad.uids[uid]; !exists {
+		ad.uids[uid] = ad.loadOrInitUID(uid)
 	}
 
-	// Compute anomaly score based on collected statistics
-	score := ad.computeAnomalyScore(features)
-	features.AnomalyScore = score
+	state := ad.uids[uid]
 
-	// Check if this is an anomaly
-	if score > ad.zscoreThreshold {
-		features.IsAnomaly = true
-		ad.emitAlert(features, score)
-	}
-}
-
-// collectBaseline stores feature values during the baseline learning phase
-func (ad *AnomalyDetector) collectBaseline(features FeatureVector) {
-	ad.stats.FileAccessCount = append(ad.stats.FileAccessCount, float64(features.FileAccessCount))
-	ad.stats.UniqueFileCount = append(ad.stats.UniqueFileCount, float64(features.UniqueFileCount))
-	ad.stats.ReadCount = append(ad.stats.ReadCount, float64(features.ReadCount))
-	ad.stats.ExecCount = append(ad.stats.ExecCount, float64(features.ExecCount))
-}
-
-// computeBaselineStats calculates mean and standard deviation for all features
-func (ad *AnomalyDetector) computeBaselineStats() {
-	ad.stats.FileAccessMean, ad.stats.FileAccessStdDev = ad.calculateMeanStdDev(ad.stats.FileAccessCount)
-	ad.stats.UniqueFileMean, ad.stats.UniqueFileStdDev = ad.calculateMeanStdDev(ad.stats.UniqueFileCount)
-	ad.stats.ReadCountMean, ad.stats.ReadCountStdDev = ad.calculateMeanStdDev(ad.stats.ReadCount)
-	ad.stats.ExecCountMean, ad.stats.ExecCountStdDev = ad.calculateMeanStdDev(ad.stats.ExecCount)
-
-	fmt.Printf("[STATS] FileAccess: mean=%.1f, stddev=%.1f\n",
-		ad.stats.FileAccessMean, ad.stats.FileAccessStdDev)
-	fmt.Printf("[STATS] UniqueFile: mean=%.1f, stddev=%.1f\n",
-		ad.stats.UniqueFileMean, ad.stats.UniqueFileStdDev)
-	fmt.Printf("[STATS] ReadCount: mean=%.1f, stddev=%.1f\n",
-		ad.stats.ReadCountMean, ad.stats.ReadCountStdDev)
-	fmt.Printf("[STATS] ExecCount: mean=%.1f, stddev=%.1f\n",
-		ad.stats.ExecCountMean, ad.stats.ExecCountStdDev)
-}
-
-// computeAnomalyScore calculates the maximum z-score across all features
-// Returns the highest z-score observed
-func (ad *AnomalyDetector) computeAnomalyScore(features FeatureVector) float64 {
-	// Prevent division by zero - if stddev is 0, baseline has no variance
-	if ad.stats.FileAccessStdDev == 0 &&
-		ad.stats.UniqueFileStdDev == 0 &&
-		ad.stats.ReadCountStdDev == 0 &&
-		ad.stats.ExecCountStdDev == 0 {
-		return 0.0
+	switch state.phase {
+	case phaseCollecting:
+		ad.collectBaseline(state, &fv)
+	case phaseDetecting:
+		ad.scoreWindow(state, &fv)
+		state.windowsScored++
 	}
 
-	maxZScore := 0.0
-
-	// Compute z-scores for each feature
-	zscores := make([]float64, 0)
-
-	// File access count z-score
-	if ad.stats.FileAccessStdDev > 0 {
-		z := math.Abs((float64(features.FileAccessCount) - ad.stats.FileAccessMean) / ad.stats.FileAccessStdDev)
-		zscores = append(zscores, z)
-	}
-
-	// Unique file count z-score
-	if ad.stats.UniqueFileStdDev > 0 {
-		z := math.Abs((float64(features.UniqueFileCount) - ad.stats.UniqueFileMean) / ad.stats.UniqueFileStdDev)
-		zscores = append(zscores, z)
-	}
-
-	// Read count z-score
-	if ad.stats.ReadCountStdDev > 0 {
-		z := math.Abs((float64(features.ReadCount) - ad.stats.ReadCountMean) / ad.stats.ReadCountStdDev)
-		zscores = append(zscores, z)
-	}
-
-	// Exec count z-score
-	if ad.stats.ExecCountStdDev > 0 {
-		z := math.Abs((float64(features.ExecCount) - ad.stats.ExecCountMean) / ad.stats.ExecCountStdDev)
-		zscores = append(zscores, z)
-	}
-
-	// Return the maximum z-score
-	for _, z := range zscores {
-		if z > maxZScore {
-			maxZScore = z
+	// Always persist the feature vector for audit trail / future re-training.
+	if ad.db != nil {
+		if err := ad.db.InsertFeatureVector(fv); err != nil {
+			fmt.Printf("[WARN] DB insert feature vector: %v\n", err)
 		}
 	}
-
-	return maxZScore
 }
 
-// calculateMeanStdDev calculates mean and standard deviation for a slice
-func (ad *AnomalyDetector) calculateMeanStdDev(values []float64) (float64, float64) {
-	if len(values) == 0 {
-		return 0.0, 0.0
+// loadOrInitUID tries to load a trained model from the DB.
+// If none exists it returns a fresh collecting-phase state.
+func (ad *AnomalyDetector) loadOrInitUID(uid string) *perUIDState {
+	if ad.db != nil {
+		baseline, found, err := ad.db.LoadBaseline(uid)
+		if err != nil {
+			fmt.Printf("[WARN] DB load baseline uid=%s: %v\n", uid, err)
+		}
+		if found {
+			model, err := UnmarshalIsolationForest(baseline.ModelJSON)
+			if err == nil {
+				fmt.Printf("[INFO] Loaded existing baseline for uid=%-6s  trained=%s  n_samples=%d\n",
+					uid, baseline.TrainedAt.Format("2006-01-02 15:04:05"), baseline.NSamples)
+				return &perUIDState{phase: phaseDetecting, model: model}
+			}
+			fmt.Printf("[WARN] Corrupted model for uid=%s, re-training: %v\n", uid, err)
+		}
 	}
-
-	// Calculate mean
-	sum := 0.0
-	for _, v := range values {
-		sum += v
-	}
-	mean := sum / float64(len(values))
-
-	// Calculate standard deviation
-	varSum := 0.0
-	for _, v := range values {
-		diff := v - mean
-		varSum += diff * diff
-	}
-	variance := varSum / float64(len(values))
-	stdDev := math.Sqrt(variance)
-
-	return mean, stdDev
+	return &perUIDState{phase: phaseCollecting}
 }
 
-// emitAlert sends an anomaly alert
-func (ad *AnomalyDetector) emitAlert(features FeatureVector, score float64) {
-	reason := ad.generateAlertReason(features)
+// collectBaseline accumulates one training sample.
+// When enough samples have been gathered it triggers training.
+func (ad *AnomalyDetector) collectBaseline(state *perUIDState, fv *FeatureVector) {
+	state.trainingData = append(state.trainingData, fv.ToFeatureArray())
+	n := len(state.trainingData)
 
+	fmt.Printf("[INFO] Baseline uid=%-6s  collecting %d/%d\n",
+		fv.UID, n, ad.baselineWindowCount)
+
+	if n >= ad.baselineWindowCount {
+		ad.trainAndSave(state, fv.UID)
+	}
+}
+
+// trainAndSave trains the IsolationForest on the accumulated data, persists
+// the model to SQLite, and transitions the UID to detection phase.
+func (ad *AnomalyDetector) trainAndSave(state *perUIDState, uid string) {
+	forest := NewIsolationForest(ad.numTrees, ad.sampleSize, ad.contamination)
+	forest.Fit(state.trainingData)
+
+	state.model = forest
+	state.phase = phaseDetecting
+
+	fmt.Printf("[INFO] Training complete  uid=%-6s  trees=%d  sample_size=%d  contamination=%.2f  threshold=%.4f\n",
+		uid, ad.numTrees, ad.sampleSize, ad.contamination, forest.Threshold)
+
+	if ad.db != nil {
+		blob, err := forest.Marshal()
+		if err != nil {
+			fmt.Printf("[WARN] Serialise model uid=%s: %v\n", uid, err)
+			return
+		}
+		b := UserBaseline{
+			UID:           uid,
+			TrainedAt:     time.Now(),
+			NSamples:      len(state.trainingData),
+			Contamination: ad.contamination,
+			ModelJSON:     blob,
+		}
+		if err := ad.db.SaveBaseline(b); err != nil {
+			fmt.Printf("[WARN] DB save baseline uid=%s: %v\n", uid, err)
+		} else {
+			fmt.Printf("[INFO] Baseline saved to DB  uid=%s\n", uid)
+		}
+	}
+
+	// Free training memory — no longer needed.
+	state.trainingData = nil
+}
+
+// scoreWindow uses the trained IsolationForest to evaluate one live window.
+func (ad *AnomalyDetector) scoreWindow(state *perUIDState, fv *FeatureVector) {
+	isAnomaly, score := state.model.IsAnomaly(fv.ToFeatureArray())
+	fv.AnomalyScore = score
+	fv.IsAnomaly = isAnomaly
+
+	if isAnomaly {
+		ad.emitAlert(*fv, score)
+	}
+}
+
+// emitAlert builds and dispatches an AnomalyAlert.
+func (ad *AnomalyDetector) emitAlert(fv FeatureVector, score float64) {
+	reason := buildAlertReason(fv, score)
 	alert := AnomalyAlert{
 		Time:        time.Now(),
-		WindowIndex: features.WindowIndex,
+		WindowIndex: fv.WindowIndex,
+		UID:         fv.UID,
 		Score:       score,
 		Reason:      reason,
-		Features:    features,
+		Features:    fv,
 	}
 
 	select {
 	case ad.alertsChan <- alert:
 	default:
-		// Channel full
+		// Drop if channel is full
+	}
+
+	if ad.db != nil {
+		if err := ad.db.InsertAlert(alert); err != nil {
+			fmt.Printf("[WARN] DB insert alert: %v\n", err)
+		}
 	}
 }
 
-// generateAlertReason creates a human-readable description of what triggered the alert
-func (ad *AnomalyDetector) generateAlertReason(features FeatureVector) string {
-	reasons := []string{}
+// ──────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────────────────────────
 
-	// Check which features exceeded thresholds
-	if ad.stats.FileAccessStdDev > 0 {
-		z := math.Abs((float64(features.FileAccessCount) - ad.stats.FileAccessMean) / ad.stats.FileAccessStdDev)
-		if z > ad.zscoreThreshold {
-			reasons = append(reasons, fmt.Sprintf("High file access rate (z=%.2f, count=%d)",
-				z, features.FileAccessCount))
-		}
+// buildAlertReason generates a human-readable description of what stood out.
+func buildAlertReason(fv FeatureVector, score float64) string {
+	parts := []string{}
+	if fv.FileAccessCount > 0 {
+		parts = append(parts, fmt.Sprintf("file_accesses=%d", fv.FileAccessCount))
 	}
-
-	if ad.stats.UniqueFileStdDev > 0 {
-		z := math.Abs((float64(features.UniqueFileCount) - ad.stats.UniqueFileMean) / ad.stats.UniqueFileStdDev)
-		if z > ad.zscoreThreshold {
-			reasons = append(reasons, fmt.Sprintf("Unusual unique file count (z=%.2f, count=%d)",
-				z, features.UniqueFileCount))
-		}
+	if fv.UniqueFileCount > 0 {
+		parts = append(parts, fmt.Sprintf("unique_files=%d", fv.UniqueFileCount))
 	}
-
-	if ad.stats.ReadCountStdDev > 0 {
-		z := math.Abs((float64(features.ReadCount) - ad.stats.ReadCountMean) / ad.stats.ReadCountStdDev)
-		if z > ad.zscoreThreshold {
-			reasons = append(reasons, fmt.Sprintf("High read operation count (z=%.2f, count=%d)",
-				z, features.ReadCount))
-		}
+	if fv.ReadCount > 0 {
+		parts = append(parts, fmt.Sprintf("reads=%d", fv.ReadCount))
 	}
-
-	if len(reasons) == 0 {
-		reasons = append(reasons, "Anomaly detected")
+	if fv.ExecCount > 0 {
+		parts = append(parts, fmt.Sprintf("execs=%d", fv.ExecCount))
 	}
-
-	return reasons[0]
+	if len(parts) == 0 {
+		return fmt.Sprintf("IsolationForest anomaly score=%.4f", score)
+	}
+	return fmt.Sprintf("IsolationForest score=%.4f [%s]", score, strings.Join(parts, " "))
 }

@@ -1,135 +1,141 @@
 package main
 
+// aggregator.go
+//
+// Collects AuditEvents from the reader, groups them into fixed-size time
+// windows, and emits one FeatureVector per (UID, window) pair.
+//
+// Per-UID windowing is required so that the ML detector can build a separate
+// Isolation Forest baseline for each system user.
+
 import (
 	"time"
 )
 
-// Aggregator collects audit events and aggregates them into feature vectors
-type Aggregator struct {
-	windowSize      time.Duration
-	currentWindow   *windowData
-	eventsChan      chan AuditEvent
-	featuresChan    chan FeatureVector
-	windowIndex     int
-}
-
-// windowData tracks data for current aggregation window
+// windowData tracks raw counters for one UID inside one time-window.
 type windowData struct {
-	startTime     time.Time
-	fileAccesses  map[string]bool // Track unique file accesses
-	readOps       int
-	openOps       int
-	execOps       int
-	totalOps      int
+	uid          string
+	startTime    time.Time
+	fileAccesses map[string]bool // set of unique file paths touched
+	readOps      int
+	openOps      int
+	execOps      int
 }
 
-// NewAggregator creates a new aggregator with specified window size
-// Typically 10 seconds per window as per requirements
+func (w *windowData) totalOps() int {
+	return w.readOps + w.openOps + w.execOps
+}
+
+// Aggregator collects audit events and emits per-UID FeatureVectors.
+type Aggregator struct {
+	windowSize   time.Duration
+	// uid -> current open window for that user
+	uidWindows   map[string]*windowData
+	eventsChan   chan AuditEvent
+	featuresChan chan FeatureVector
+	windowIndex  int
+}
+
+// NewAggregator creates an aggregator with the given window duration.
 func NewAggregator(windowSize time.Duration) *Aggregator {
 	return &Aggregator{
 		windowSize:   windowSize,
+		uidWindows:   make(map[string]*windowData),
 		eventsChan:   make(chan AuditEvent, 1000),
 		featuresChan: make(chan FeatureVector, 100),
 		windowIndex:  0,
 	}
 }
 
-// GetEventsChan returns the channel for sending audit events to aggregator
+// GetEventsChan returns the write-end of the events channel.
 func (a *Aggregator) GetEventsChan() chan<- AuditEvent {
 	return a.eventsChan
 }
 
-// GetFeaturesChan returns the channel for receiving aggregated feature vectors
+// GetFeaturesChan returns the read-end of the features channel.
 func (a *Aggregator) GetFeaturesChan() <-chan FeatureVector {
 	return a.featuresChan
 }
 
-// Start begins the aggregation process
-// Should be run in a goroutine
+// Start runs the aggregation loop.  Should be called in a goroutine.
 func (a *Aggregator) Start() {
-	a.currentWindow = a.newWindow()
-
 	windowTicker := time.NewTicker(a.windowSize)
 	defer windowTicker.Stop()
 
 	for {
 		select {
 		case event := <-a.eventsChan:
-			// Check if we need to flush current window
-			if event.Timestamp.Sub(a.currentWindow.startTime) >= a.windowSize {
-				// Emit current window
-				a.emitWindow()
-				// Start new window
-				a.currentWindow = a.newWindow()
+			if !event.Success {
+				continue
+			}
+			uid := event.UID
+
+			// Open a fresh window for this UID if none exists
+			if _, ok := a.uidWindows[uid]; !ok {
+				a.uidWindows[uid] = a.newWindow(uid)
 			}
 
-			// Add event to current window
-			a.addEventToWindow(event)
+			win := a.uidWindows[uid]
+
+			// Flush if the event falls outside the current window
+			if event.Timestamp.Sub(win.startTime) >= a.windowSize {
+				a.emitWindow(win)
+				a.uidWindows[uid] = a.newWindow(uid)
+				win = a.uidWindows[uid]
+			}
+
+			a.addEventToWindow(win, event)
 
 		case <-windowTicker.C:
-			// Periodic window flush (in case no events for a while)
-			if a.currentWindow.totalOps > 0 {
-				a.emitWindow()
-				a.currentWindow = a.newWindow()
+			// Periodically flush all non-empty user windows
+			for uid, win := range a.uidWindows {
+				if win.totalOps() > 0 {
+					a.emitWindow(win)
+					a.uidWindows[uid] = a.newWindow(uid)
+				}
 			}
 		}
 	}
 }
 
-// newWindow creates a fresh window data structure
-func (a *Aggregator) newWindow() *windowData {
+// newWindow allocates a fresh windowData for uid at the current time.
+func (a *Aggregator) newWindow(uid string) *windowData {
 	return &windowData{
+		uid:          uid,
 		startTime:    time.Now(),
 		fileAccesses: make(map[string]bool),
-		readOps:      0,
-		openOps:      0,
-		execOps:      0,
-		totalOps:     0,
 	}
 }
 
-// addEventToWindow adds an event to the current aggregation window
-func (a *Aggregator) addEventToWindow(event AuditEvent) {
-	if !event.Success {
-		return // Ignore failed operations
-	}
-
-	a.currentWindow.totalOps++
-
+// addEventToWindow routes one event into the appropriate counters.
+func (a *Aggregator) addEventToWindow(win *windowData, event AuditEvent) {
 	switch event.EventType {
-	case "open":
-		a.currentWindow.openOps++
+	case "open", "close_write":
+		win.openOps++
 		if event.FilePath != "" {
-			a.currentWindow.fileAccesses[event.FilePath] = true
+			win.fileAccesses[event.FilePath] = true
 		}
 	case "read":
-		a.currentWindow.readOps++
+		win.readOps++
 		if event.FilePath != "" {
-			a.currentWindow.fileAccesses[event.FilePath] = true
+			win.fileAccesses[event.FilePath] = true
 		}
 	case "execve":
-		a.currentWindow.execOps++
+		win.execOps++
 	}
 }
 
-// emitWindow creates a feature vector from the current window and sends it
-func (a *Aggregator) emitWindow() {
+// emitWindow builds a FeatureVector and sends it on featuresChan.
+func (a *Aggregator) emitWindow(win *windowData) {
 	features := FeatureVector{
-		Timestamp:       a.currentWindow.startTime,
+		Timestamp:       win.startTime,
 		WindowIndex:     a.windowIndex,
-		FileAccessCount: a.currentWindow.openOps + a.currentWindow.readOps,
-		UniqueFileCount: len(a.currentWindow.fileAccesses),
-		ReadCount:       a.currentWindow.readOps,
-		ExecCount:       a.currentWindow.execOps,
+		UID:             win.uid,
+		FileAccessCount: win.openOps + win.readOps,
+		UniqueFileCount: len(win.fileAccesses),
+		ReadCount:       win.readOps,
+		ExecCount:       win.execOps,
 		AnomalyScore:    0.0,
 		IsAnomaly:       false,
 	}
-
-	select {
-	case a.featuresChan <- features:
-	default:
-		// Channel full, drop oldest (shouldn't happen in normal operation)
-	}
-
-	a.windowIndex++
 }
