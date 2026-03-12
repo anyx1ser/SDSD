@@ -138,4 +138,6 @@ func (a *Aggregator) emitWindow(win *windowData) {
 		AnomalyScore:    0.0,
 		IsAnomaly:       false,
 	}
+	a.featuresChan <- features
+	a.windowIndex++
 }
