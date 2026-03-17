@@ -3,11 +3,9 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -16,31 +14,31 @@ import (
 )
 
 const (
-	FAN_CLASS_NOTIF      = 0x0
-	FAN_ACCESS           = 0x1
-	FAN_MODIFY           = 0x2
-	FAN_CLOSE_WRITE      = 0x8
-	FAN_CLOSE_NOWRITE    = 0x10
-	FAN_OPEN             = 0x20
-	FAN_OPEN_EXEC        = 0x1000
-	FAN_ACCESS_PERM      = 0x20000
-	FAN_ONDIR            = 0x40000000
-	FAN_EVENT_ON_CHILD   = 0x08000000
-	FAN_UNLIMITED_QUEUE  = 0x0
-	FAN_UNLIMITED_MARKS  = 0x20
-	FAN_MARK_ADD         = 0x1
-	FAN_MARK_FILESYSTEM  = 0x100
+	FAN_CLASS_NOTIF     = 0x0
+	FAN_ACCESS          = 0x1
+	FAN_MODIFY          = 0x2
+	FAN_CLOSE_WRITE     = 0x8
+	FAN_CLOSE_NOWRITE   = 0x10
+	FAN_OPEN            = 0x20
+	FAN_OPEN_EXEC       = 0x1000
+	FAN_ACCESS_PERM     = 0x20000
+	FAN_ONDIR           = 0x40000000
+	FAN_EVENT_ON_CHILD  = 0x08000000
+	FAN_UNLIMITED_QUEUE = 0x0
+	FAN_UNLIMITED_MARKS = 0x20
+	FAN_MARK_ADD        = 0x1
+	FAN_MARK_FILESYSTEM = 0x100
 )
 
 type FanotifyEvent struct {
-	EventLen    uint32
-	Vers        uint8
-	Reserved    uint8
-	Metadata    uint16
-	Mask        uint64
-	Fd          int32
-	Pid         int32
-	_           [4]byte // padding
+	EventLen uint32
+	Vers     uint8
+	Reserved uint8
+	Metadata uint16
+	Mask     uint64
+	Fd       int32
+	Pid      int32
+	_        [4]byte // padding
 }
 
 // FanotifyMonitor monitors file system events using fanotify
@@ -51,9 +49,22 @@ type FanotifyMonitor struct {
 
 // NewFanotifyMonitor creates a new fanotify monitor for targets
 func NewFanotifyMonitor(targets []string) *FanotifyMonitor {
+	normalized := make([]string, 0, len(targets))
+	for _, t := range targets {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		clean := filepath.Clean(t)
+		if !strings.HasPrefix(clean, "/") {
+			continue
+		}
+		normalized = append(normalized, clean)
+	}
+
 	return &FanotifyMonitor{
 		fd:      -1,
-		targets: targets,
+		targets: normalized,
 	}
 }
 
@@ -114,7 +125,7 @@ func (fm *FanotifyMonitor) Start(eventsChan chan<- AuditEvent) error {
 		// Parse events
 		offset := 0
 		for offset < n {
-			if offset+unsafe.Sizeof(FanotifyEvent{}) > n {
+			if offset+int(unsafe.Sizeof(FanotifyEvent{})) > n {
 				break
 			}
 
@@ -131,6 +142,11 @@ func (fm *FanotifyMonitor) Start(eventsChan chan<- AuditEvent) error {
 				offset += int(event.EventLen)
 				continue
 			}
+			if !fm.isPathMonitored(filePath) {
+				unix.Close(int(event.Fd))
+				offset += int(event.EventLen)
+				continue
+			}
 
 			// Get process name
 			procPath := fmt.Sprintf("/proc/%d/comm", event.Pid)
@@ -140,6 +156,21 @@ func (fm *FanotifyMonitor) Start(eventsChan chan<- AuditEvent) error {
 				procName = strings.TrimSpace(string(procNameBytes))
 			} else {
 				procName = fmt.Sprintf("pid_%d", event.Pid)
+			}
+
+			// Get real UID from /proc/<pid>/status  (line: "Uid:\t<real> <eff> <saved> <fs>")
+			uid := fmt.Sprintf("%d", event.Pid) // fallback to pid if unreadable
+			statusBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", event.Pid))
+			if err == nil {
+				for _, statusLine := range strings.Split(string(statusBytes), "\n") {
+					if strings.HasPrefix(statusLine, "Uid:") {
+						fields := strings.Fields(statusLine)
+						if len(fields) >= 2 {
+							uid = fields[1] // real UID
+						}
+						break
+					}
+				}
 			}
 
 			// Determine event type
@@ -160,7 +191,7 @@ func (fm *FanotifyMonitor) Start(eventsChan chan<- AuditEvent) error {
 			// Create audit event
 			auditEvent := AuditEvent{
 				Timestamp:   time.Now(),
-				UID:         fmt.Sprintf("%d", event.Pid),
+				UID:         uid,
 				ProcessName: procName,
 				FilePath:    filePath,
 				EventType:   eventType,
@@ -180,4 +211,20 @@ func (fm *FanotifyMonitor) Start(eventsChan chan<- AuditEvent) error {
 			offset += int(event.EventLen)
 		}
 	}
+}
+
+func (fm *FanotifyMonitor) isPathMonitored(path string) bool {
+	if path == "" {
+		return false
+	}
+	cleanPath := filepath.Clean(path)
+	for _, target := range fm.targets {
+		if cleanPath == target {
+			return true
+		}
+		if strings.HasPrefix(cleanPath, target+"/") {
+			return true
+		}
+	}
+	return false
 }

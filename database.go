@@ -39,7 +39,10 @@ CREATE TABLE IF NOT EXISTS baselines (
     trained_at      TEXT    NOT NULL,   -- RFC-3339 timestamp
     n_samples       INTEGER NOT NULL,
     contamination   REAL    NOT NULL,
-    threshold       REAL    NOT NULL,   -- decision threshold from training
+		threshold       REAL    NOT NULL,   -- reserved for compatibility
+		z_threshold     REAL    NOT NULL DEFAULT 0,
+		mean_json       BLOB,
+		variance_json   BLOB,
     model_json      BLOB    NOT NULL    -- JSON-serialised IsolationForest
 );
 
@@ -48,10 +51,12 @@ CREATE TABLE IF NOT EXISTS feature_vectors (
     recorded_at         TEXT    NOT NULL,
     window_index        INTEGER NOT NULL,
     uid                 TEXT    NOT NULL,
-    file_access_count   INTEGER NOT NULL DEFAULT 0,
-    unique_file_count   INTEGER NOT NULL DEFAULT 0,
-    read_count          INTEGER NOT NULL DEFAULT 0,
-    exec_count          INTEGER NOT NULL DEFAULT 0,
+		file_access_count   INTEGER NOT NULL DEFAULT 0,
+		unique_file_count   INTEGER NOT NULL DEFAULT 0,
+		read_count          INTEGER NOT NULL DEFAULT 0,
+		write_count         INTEGER NOT NULL DEFAULT 0,
+		unique_dir_count    INTEGER NOT NULL DEFAULT 0,
+		process_entropy     REAL    NOT NULL DEFAULT 0,
     anomaly_score       REAL    NOT NULL DEFAULT 0.0,
     is_anomaly          INTEGER NOT NULL DEFAULT 0
 );
@@ -69,7 +74,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     file_access_count   INTEGER NOT NULL DEFAULT 0,
     unique_file_count   INTEGER NOT NULL DEFAULT 0,
     read_count          INTEGER NOT NULL DEFAULT 0,
-    exec_count          INTEGER NOT NULL DEFAULT 0
+		write_count         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_alerts_uid       ON alerts (uid);
@@ -107,7 +112,58 @@ func NewDatabase(path string) (*Database, error) {
 }
 
 func (d *Database) initSchema() error {
-	_, err := d.db.Exec(dbDDL)
+	if _, err := d.db.Exec(dbDDL); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("baselines", "z_threshold", "ALTER TABLE baselines ADD COLUMN z_threshold REAL NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("baselines", "mean_json", "ALTER TABLE baselines ADD COLUMN mean_json BLOB"); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("baselines", "variance_json", "ALTER TABLE baselines ADD COLUMN variance_json BLOB"); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("feature_vectors", "write_count", "ALTER TABLE feature_vectors ADD COLUMN write_count INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("feature_vectors", "unique_dir_count", "ALTER TABLE feature_vectors ADD COLUMN unique_dir_count INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("feature_vectors", "process_entropy", "ALTER TABLE feature_vectors ADD COLUMN process_entropy REAL NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("alerts", "write_count", "ALTER TABLE alerts ADD COLUMN write_count INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *Database) ensureColumn(table, column, alterSQL string) error {
+	rows, err := d.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var ctype string
+		var notNull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = d.db.Exec(alterSQL)
 	return err
 }
 
@@ -126,13 +182,16 @@ func (d *Database) SaveBaseline(b UserBaseline) error {
 	defer d.mu.Unlock()
 
 	const q = `
-		INSERT INTO baselines (uid, trained_at, n_samples, contamination, threshold, model_json)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO baselines (uid, trained_at, n_samples, contamination, threshold, z_threshold, mean_json, variance_json, model_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(uid) DO UPDATE SET
 			trained_at    = excluded.trained_at,
 			n_samples     = excluded.n_samples,
 			contamination = excluded.contamination,
 			threshold     = excluded.threshold,
+			z_threshold   = excluded.z_threshold,
+			mean_json     = excluded.mean_json,
+			variance_json = excluded.variance_json,
 			model_json    = excluded.model_json`
 
 	_, err := d.db.Exec(q,
@@ -140,17 +199,10 @@ func (d *Database) SaveBaseline(b UserBaseline) error {
 		b.TrainedAt.UTC().Format(time.RFC3339),
 		b.NSamples,
 		b.Contamination,
-		// Extract threshold from the model for quick access queries
-		func() float64 {
-			if b.ModelJSON == nil {
-				return 0
-			}
-			m, e := UnmarshalIsolationForest(b.ModelJSON)
-			if e != nil {
-				return 0
-			}
-			return m.Threshold
-		}(),
+		0.0,
+		b.ZThreshold,
+		b.MeanJSON,
+		b.VarianceJSON,
 		b.ModelJSON,
 	)
 	return err
@@ -158,13 +210,13 @@ func (d *Database) SaveBaseline(b UserBaseline) error {
 
 // LoadBaseline returns the persisted baseline for uid, or (zero, nil) when absent.
 func (d *Database) LoadBaseline(uid string) (UserBaseline, bool, error) {
-	const q = `SELECT uid, trained_at, n_samples, contamination, model_json
+	const q = `SELECT uid, trained_at, n_samples, contamination, z_threshold, mean_json, variance_json, model_json
 	           FROM baselines WHERE uid = ?`
 
 	row := d.db.QueryRow(q, uid)
 	var b UserBaseline
 	var trainedAtStr string
-	err := row.Scan(&b.UID, &trainedAtStr, &b.NSamples, &b.Contamination, &b.ModelJSON)
+	err := row.Scan(&b.UID, &trainedAtStr, &b.NSamples, &b.Contamination, &b.ZThreshold, &b.MeanJSON, &b.VarianceJSON, &b.ModelJSON)
 	if err == sql.ErrNoRows {
 		return UserBaseline{}, false, nil
 	}
@@ -217,18 +269,20 @@ func (d *Database) InsertFeatureVector(fv FeatureVector) error {
 	const q = `
 		INSERT INTO feature_vectors
 			(recorded_at, window_index, uid,
-			 file_access_count, unique_file_count, read_count, exec_count,
+			 file_access_count, unique_file_count, read_count, write_count, unique_dir_count, process_entropy,
 			 anomaly_score, is_anomaly)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := d.db.Exec(q,
 		fv.Timestamp.UTC().Format(time.RFC3339),
 		fv.WindowIndex,
 		fv.UID,
-		fv.FileAccessCount,
-		fv.UniqueFileCount,
-		fv.ReadCount,
-		fv.ExecCount,
+		fv.TotalFileAccesses,
+		fv.UniqueFilesAccessed,
+		fv.ReadOperations,
+		fv.WriteOperations,
+		fv.UniqueDirectoriesAccessed,
+		fv.ProcessEntropy,
 		fv.AnomalyScore,
 		boolToInt(fv.IsAnomaly),
 	)
@@ -240,7 +294,7 @@ func (d *Database) InsertFeatureVector(fv FeatureVector) error {
 func (d *Database) GetFeatureVectorsForUID(uid string, limit int) ([]FeatureVector, error) {
 	const q = `
 		SELECT recorded_at, window_index, uid,
-		       file_access_count, unique_file_count, read_count, exec_count,
+		       file_access_count, unique_file_count, read_count, write_count, unique_dir_count, process_entropy,
 		       anomaly_score, is_anomaly
 		FROM feature_vectors
 		WHERE uid = ?
@@ -260,7 +314,7 @@ func (d *Database) GetFeatureVectorsForUID(uid string, limit int) ([]FeatureVect
 		var isAnomaly int
 		if err := rows.Scan(
 			&recAt, &fv.WindowIndex, &fv.UID,
-			&fv.FileAccessCount, &fv.UniqueFileCount, &fv.ReadCount, &fv.ExecCount,
+			&fv.TotalFileAccesses, &fv.UniqueFilesAccessed, &fv.ReadOperations, &fv.WriteOperations, &fv.UniqueDirectoriesAccessed, &fv.ProcessEntropy,
 			&fv.AnomalyScore, &isAnomaly,
 		); err != nil {
 			return nil, err
@@ -296,7 +350,7 @@ func (d *Database) InsertAlert(a AnomalyAlert) error {
 	const q = `
 		INSERT INTO alerts
 			(alerted_at, window_index, uid, score, reason,
-			 file_access_count, unique_file_count, read_count, exec_count)
+			 file_access_count, unique_file_count, read_count, write_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	fv := a.Features
@@ -306,10 +360,10 @@ func (d *Database) InsertAlert(a AnomalyAlert) error {
 		a.UID,
 		a.Score,
 		a.Reason,
-		fv.FileAccessCount,
-		fv.UniqueFileCount,
-		fv.ReadCount,
-		fv.ExecCount,
+		fv.TotalFileAccesses,
+		fv.UniqueFilesAccessed,
+		fv.ReadOperations,
+		fv.WriteOperations,
 	)
 	return err
 }

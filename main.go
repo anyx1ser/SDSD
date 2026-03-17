@@ -12,14 +12,15 @@ import (
 
 func main() {
 	// ── Command-line flags ────────────────────────────────────────────────────
-	monitorPaths    := flag.String("paths", "/home,/etc,/var,/tmp,/opt", "Comma-separated paths to monitor")
-	windowSize      := flag.Duration("window", 10*time.Second, "Aggregation window size")
+	monitorPaths := flag.String("paths", "/home,/etc", "Comma-separated paths to monitor")
+	windowSize := flag.Duration("window", 10*time.Second, "Aggregation window size")
+	windowStep := flag.Duration("step", 2*time.Second, "Sliding-window step interval")
 	baselineWindows := flag.Int("baseline", 60, "Windows to collect per UID before training the Isolation Forest")
-	dbPath          := flag.String("db", "sdsd_baselines.db", "SQLite database file for persisting user baselines")
-	contamination   := flag.Float64("contamination", 0.1, "Expected fraction of anomalies in training data (IsolationForest)")
-	numTrees        := flag.Int("estimators", 100, "Number of isolation trees (IsolationForest n_estimators)")
-	sampleSize      := flag.Int("sample-size", 256, "Sub-sample size per tree (IsolationForest max_samples)")
-	verbose         := flag.Bool("verbose", false, "Enable verbose output")
+	dbPath := flag.String("db", "sdsd_baselines.db", "SQLite database file for persisting user baselines")
+	contamination := flag.Float64("contamination", 0.1, "Expected fraction of anomalies in training data (IsolationForest)")
+	numTrees := flag.Int("estimators", 100, "Number of isolation trees (IsolationForest n_estimators)")
+	sampleSize := flag.Int("sample-size", 256, "Sub-sample size per tree (IsolationForest max_samples)")
+	verbose := flag.Bool("verbose", false, "Enable verbose output")
 
 	flag.Parse()
 
@@ -38,6 +39,7 @@ func main() {
 	fmt.Printf("=== SDSD — Isolation Forest Anomaly Detection Agent ===\n")
 	fmt.Printf("Monitor paths  : %s\n", strings.Join(paths, ", "))
 	fmt.Printf("Window size    : %v\n", *windowSize)
+	fmt.Printf("Window step    : %v\n", *windowStep)
 	fmt.Printf("Baseline windows/UID : %d\n", *baselineWindows)
 	fmt.Printf("ML model       : IsolationForest(n_estimators=%d, max_samples=%d, contamination=%.2f)\n",
 		*numTrees, *sampleSize, *contamination)
@@ -67,7 +69,7 @@ func main() {
 	}
 	defer monitor.Close()
 
-	aggregator := NewAggregator(*windowSize)
+	aggregator := NewAggregator(*windowSize, *windowStep)
 	alertsChan := make(chan AnomalyAlert, 100)
 
 	detector := NewAnomalyDetector(
@@ -111,18 +113,21 @@ func main() {
 // printAlerts outputs detected anomalies to stdout.
 func printAlerts(alertsChan <-chan AnomalyAlert) {
 	for alert := range alertsChan {
-		fmt.Printf("[ALERT] time=%s uid=%-6s window=%d score=%.4f reason=%s\n",
+		fmt.Printf("[ALERT] timestamp=%s user=%-6s score=%.4f reason=%s\n",
 			alert.Time.Format("2006-01-02 15:04:05"),
 			alert.UID,
-			alert.WindowIndex,
 			alert.Score,
 			alert.Reason,
 		)
-		fmt.Printf("        FileAccessCount=%d UniqueFiles=%d ReadOps=%d ExecOps=%d\n",
-			alert.Features.FileAccessCount,
-			alert.Features.UniqueFileCount,
-			alert.Features.ReadCount,
-			alert.Features.ExecCount,
+		fmt.Printf("        accesses=%d reads=%d writes=%d unique_files=%d unique_dirs=%d rate=%.2f/s burst=%d archive_pattern=%v\n",
+			alert.Features.TotalFileAccesses,
+			alert.Features.ReadOperations,
+			alert.Features.WriteOperations,
+			alert.Features.UniqueFilesAccessed,
+			alert.Features.UniqueDirectoriesAccessed,
+			alert.Features.FileAccessRate,
+			alert.Features.MaxEventsInShortInterval,
+			alert.Features.ArchiveLikeAccessPattern,
 		)
 	}
 }
